@@ -1,13 +1,13 @@
 """
-GitHub Notify Bot
------------------
-A Discord bot that posts a message whenever a GitHub repository gets updated.
+GitHub Notify Bot v2 — now with fancy embeds!
+----------------------------------------------
+Posts pretty embed cards (like the official GitHub bot) whenever
+a watched repository gets updated.
 
-How it works:
-1. An admin types:  !notifyhere owner/repo-name   in a Discord channel
-2. The bot remembers "send updates for that repo to this channel"
-3. In the GitHub repo settings, you add a webhook pointing to this bot
-4. When someone pushes code, GitHub pings the bot and the bot posts in Discord
+Admin commands:
+  !notifyhere owner/repo   -> send that repo's updates to this channel
+  !stopnotify owner/repo   -> stop watching a repo
+  !watching                -> list watched repos (anyone can use)
 """
 
 import os
@@ -17,11 +17,12 @@ from discord.ext import commands
 from aiohttp import web
 
 # ---------- SETTINGS ----------
-TOKEN = os.environ["DISCORD_TOKEN"]        # your bot token (kept secret!)
-PORT = int(os.environ.get("PORT", 8080))   # Railway gives us this automatically
-SAVE_FILE = "watched_repos.json"           # where we remember repo -> channel
+TOKEN = os.environ["DISCORD_TOKEN"]
+PORT = int(os.environ.get("PORT", 8080))
+SAVE_FILE = "watched_repos.json"
+GITHUB_GREEN = 0x2ECC40   # the green stripe colour
 
-# ---------- MEMORY (which repo goes to which channel) ----------
+# ---------- MEMORY ----------
 def load_repos():
     try:
         with open(SAVE_FILE) as f:
@@ -33,7 +34,7 @@ def save_repos(repos):
     with open(SAVE_FILE, "w") as f:
         json.dump(repos, f, indent=2)
 
-watched = load_repos()   # looks like: {"owner/repo": channel_id}
+watched = load_repos()
 
 # ---------- THE DISCORD BOT ----------
 intents = discord.Intents.default()
@@ -45,9 +46,8 @@ async def on_ready():
     print(f"Logged in as {bot.user}! Watching {len(watched)} repos.")
 
 @bot.command()
-@commands.has_permissions(administrator=True)   # admins only!
+@commands.has_permissions(administrator=True)
 async def notifyhere(ctx, repo: str):
-    """Admin command: !notifyhere owner/repo"""
     repo = repo.lower().strip()
     if "/" not in repo:
         await ctx.send("Please write it like this: `!notifyhere owner/repo-name`")
@@ -56,13 +56,12 @@ async def notifyhere(ctx, repo: str):
     save_repos(watched)
     await ctx.send(
         f"✅ Got it! Updates for **{repo}** will be posted in this channel.\n"
-        f"Now add a webhook in that repo's GitHub settings (ask the bot owner for the URL)."
+        f"Now add a webhook in that repo's GitHub settings."
     )
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def stopnotify(ctx, repo: str):
-    """Admin command: !stopnotify owner/repo"""
     repo = repo.lower().strip()
     if watched.pop(repo, None) is not None:
         save_repos(watched)
@@ -72,18 +71,59 @@ async def stopnotify(ctx, repo: str):
 
 @bot.command()
 async def watching(ctx):
-    """Anyone can ask: !watching"""
     if not watched:
         await ctx.send("I'm not watching any repos yet!")
         return
     lines = [f"• **{repo}** → <#{channel_id}>" for repo, channel_id in watched.items()]
     await ctx.send("I'm watching:\n" + "\n".join(lines))
 
-# ---------- THE WEBHOOK SERVER (GitHub knocks on this door) ----------
+# ---------- BUILDING THE FANCY EMBED ----------
+def build_push_embed(data):
+    """Make an embed card that looks like the official GitHub bot."""
+    repo = data.get("repository", {})
+    repo_name = repo.get("full_name", "unknown/repo")
+    repo_url = repo.get("html_url", "https://github.com")
+
+    # branch name comes as "refs/heads/main" -> we just want "main"
+    branch = data.get("ref", "refs/heads/?").split("/")[-1]
+
+    commits = data.get("commits", [])
+    count = len(commits)
+    plural = "s" if count != 1 else ""
+
+    # the person who pushed (name + profile picture)
+    sender = data.get("sender", {})
+    pusher_name = data.get("pusher", {}).get("name", "someone")
+    avatar = sender.get("avatar_url", "")
+
+    embed = discord.Embed(
+        title=f"[{repo_name}:{branch}] {count} new commit{plural}",
+        url=data.get("compare", repo_url),   # clicking the title shows the changes
+        color=GITHUB_GREEN,
+    )
+    embed.set_author(name=pusher_name, icon_url=avatar)
+
+    # one line per commit: short-hash  message - author  (max 10 lines)
+    lines = []
+    for c in commits[:10]:
+        short_hash = c.get("id", "0000000")[:7]
+        commit_url = c.get("url", repo_url)
+        message = c.get("message", "").split("\n")[0]
+        if len(message) > 60:
+            message = message[:57] + "..."
+        author = c.get("author", {}).get("username") or c.get("author", {}).get("name", "?")
+        lines.append(f"[`{short_hash}`]({commit_url}) {message} - {author}")
+
+    if count > 10:
+        lines.append(f"...and {count - 10} more!")
+
+    embed.description = "\n".join(lines) if lines else "*No commit details*"
+    return embed
+
+# ---------- THE WEBHOOK SERVER ----------
 async def github_webhook(request):
     data = await request.json()
-    repo_info = data.get("repository", {})
-    repo_name = repo_info.get("full_name", "").lower()
+    repo_name = data.get("repository", {}).get("full_name", "").lower()
 
     channel_id = watched.get(repo_name)
     if channel_id is None:
@@ -96,15 +136,14 @@ async def github_webhook(request):
     event = request.headers.get("X-GitHub-Event", "something")
 
     if event == "push":
-        pusher = data.get("pusher", {}).get("name", "someone")
-        commits = data.get("commits", [])
-        msg = f"📦 **{repo_name}** was updated by **{pusher}**!"
-        if commits:
-            latest = commits[-1].get("message", "").split("\n")[0][:100]
-            msg += f"\n💬 Latest change: *{latest}*"
-        await channel.send(msg)
+        if data.get("commits"):                      # normal push with commits
+            await channel.send(embed=build_push_embed(data))
     elif event == "ping":
-        await channel.send(f"🔔 Webhook connected for **{repo_name}**! I'm listening.")
+        embed = discord.Embed(
+            description=f"🔔 Webhook connected for **{repo_name}**! I'm listening.",
+            color=GITHUB_GREEN,
+        )
+        await channel.send(embed=embed)
     else:
         await channel.send(f"ℹ️ **{repo_name}** had a `{event}` event.")
 
