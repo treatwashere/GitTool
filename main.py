@@ -18,7 +18,7 @@ from discord.ext import commands
 from aiohttp import web
 
 # ---------- SETTINGS ----------
-TOKEN = os.environ["DISCORD_TOKEN"]
+TOKEN = os.environ["MTUyOTQ0ODMwNzQyNjk4ODEwMg.GJKYlb.wUFCfdBVs1xAluwyQw3DTF4zgfP_TNXorubW_Q"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 PORT = int(os.environ.get("PORT", 8080))
 GITHUB_GREEN = 0x2ECC40
